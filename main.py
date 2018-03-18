@@ -1,14 +1,18 @@
+#!/usr/bin/env python
 '''Train CIFAR10 with PyTorch.'''
 from __future__ import print_function
+import sys
+sys.path.insert(0, '../picpac/build/lib.linux-x86_64-%d.%d' % sys.version_info[:2])
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
+from torch.optim.lr_scheduler import MultiStepLR 
 
-import torchvision
-import torchvision.transforms as transforms
+import numpy as np
+import picpac
 
 import os
 import argparse
@@ -29,23 +33,46 @@ start_epoch = 0  # start from epoch 0 or last checkpoint epoch
 
 # Data
 print('==> Preparing data..')
-transform_train = transforms.Compose([
-    transforms.RandomCrop(32, padding=4),
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-])
+# NOTE THAT PICPAC CHANNEL
+mu1 = [0.4465, 0.4822, 0.4914]  
+sigma1 = [0.2010, 0.1994, 0.2023]
 
-transform_test = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-])
+BATCH = 128
+SIZE = 32
 
-trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
-trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2)
+normalize = {"type": "normalize", "mean": [x * 255 for x in mu1], "std": [x * 255 for x in sigma1]}
+picpac_config = {"db": 'cifar10-train.picpac',
+          "loop": True,
+          "shuffle": True,
+          "reshuffle": True,
+          "annotate": False,
+          "channels": 3,
+          "stratify": True,
+          "dtype": "float32",
+          "batch": BATCH,
+          "order": "NCHW",
+          "transforms": [
+              {"type": "augment.flip", "horizontal": True, "vertical": False},
+              normalize,
+              {"type": "clip", "size": SIZE, "shift": 4},
+          ]
+         }
 
-testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
-testloader = torch.utils.data.DataLoader(testset, batch_size=100, shuffle=False, num_workers=2)
+stream = picpac.ImageStream(picpac_config)
+
+val_config = {"db": 'cifar10-test.picpac',
+          "loop": False,
+          "channels": 3,
+          "dtype": "float32",
+          "batch": BATCH,
+          "order": "NCHW",
+          "transforms": [
+                normalize,
+                {"type": "clip", "size": SIZE},
+          ]
+         }
+val_stream = picpac.ImageStream(val_config)
+
 
 classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
 
@@ -79,6 +106,7 @@ if use_cuda:
 
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+scheduler = MultiStepLR(optimizer, milestones=[150,250], gamma=0.1)
 
 # Training
 def train(epoch):
@@ -87,7 +115,13 @@ def train(epoch):
     train_loss = 0
     correct = 0
     total = 0
-    for batch_idx, (inputs, targets) in enumerate(trainloader):
+    epoch_steps = stream.size() // BATCH
+    for batch_idx in range(epoch_steps):
+        meta, inputs = stream.next()
+        targets = meta.labels.astype(np.int64)
+        inputs = torch.from_numpy(inputs)
+        targets = torch.from_numpy(targets)
+
         if use_cuda:
             inputs, targets = inputs.cuda(), targets.cuda()
         optimizer.zero_grad()
@@ -102,7 +136,7 @@ def train(epoch):
         total += targets.size(0)
         correct += predicted.eq(targets.data).cpu().sum()
 
-        progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
+        progress_bar(batch_idx, epoch_steps, 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
             % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
 
 def test(epoch):
@@ -111,7 +145,14 @@ def test(epoch):
     test_loss = 0
     correct = 0
     total = 0
-    for batch_idx, (inputs, targets) in enumerate(testloader):
+    val_steps = val_stream.size() // BATCH
+    val_stream.reset()
+    step = 0
+    for meta, inputs in val_stream:
+        targets = meta.labels.astype(np.int32)
+        inputs = torch.from_numpy(inputs)
+        targets = torch.from_numpy(targets)
+
         if use_cuda:
             inputs, targets = inputs.cuda(), targets.cuda()
         inputs, targets = Variable(inputs, volatile=True), Variable(targets)
@@ -123,8 +164,9 @@ def test(epoch):
         total += targets.size(0)
         correct += predicted.eq(targets.data).cpu().sum()
 
-        progress_bar(batch_idx, len(testloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
+        progress_bar(step, val_steps, 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
             % (test_loss/(batch_idx+1), 100.*correct/total, correct, total))
+        step += 1
 
     # Save checkpoint.
     acc = 100.*correct/total
@@ -141,6 +183,8 @@ def test(epoch):
         best_acc = acc
 
 
-for epoch in range(start_epoch, start_epoch+200):
+for epoch in range(start_epoch, start_epoch+350):
+    scheduler.step()
     train(epoch)
     test(epoch)
+
